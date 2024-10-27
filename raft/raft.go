@@ -10,8 +10,17 @@ import (
 
 const DebugMode = 1
 
+type CommitEntry struct {
+	// client command
+	Command any
+	// index of log entry
+	Index int
+	// term number
+	Term int
+}
+
 type LogEntry struct {
-	Command interface{}
+	Command any
 	Term    int
 }
 
@@ -55,18 +64,35 @@ type RaftService struct {
 	voteFor     int
 	log         []LogEntry
 
+	// commit log channel
+	commitChan chan<- CommitEntry
+	// new commit ready channel to notify entries may be send to commitChan
+	newCommitReadyChan chan struct{}
+
 	// volatile states
 	state              RaftState
 	electionResetEvent time.Time
+	commitIndex        int
+	lastApplied        int
+
+	// volatile states for leaders
+	nextIndex  map[int]int
+	matchIndex map[int]int
 }
 
-func NewRaftService(id int, peerIds []int, server *Server, ready <-chan interface{}) *RaftService {
+func NewRaftService(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *RaftService {
 	rs := new(RaftService)
 	rs.id = id
 	rs.peerIds = peerIds
 	rs.server = server
 	rs.state = Follower
 	rs.voteFor = -1
+	rs.commitIndex = -1
+	rs.lastApplied = -1
+	rs.commitChan = commitChan
+	rs.newCommitReadyChan = make(chan struct{}, 16)
+	rs.nextIndex = make(map[int]int)
+	rs.matchIndex = make(map[int]int)
 
 	go func() {
 		// ready は値を受信するまでブロックしている
@@ -79,6 +105,7 @@ func NewRaftService(id int, peerIds []int, server *Server, ready <-chan interfac
 		rs.runElectionTimer()
 	}()
 
+	go rs.commitChanSender()
 	return rs
 }
 
@@ -88,6 +115,7 @@ func (rs *RaftService) Stop() {
 
 	rs.state = Dead
 	rs.dlog("becomes Dead")
+	close(rs.newCommitReadyChan)
 }
 
 // Report the state of RaftService
@@ -156,9 +184,14 @@ func (rs *RaftService) startElection() {
 	// send RequestVote RPCs to all other servers
 	for _, peerId := range rs.peerIds {
 		go func(peerId int) {
+			rs.mutex.Lock()
+			lastLogIndex, lastLogTerm := rs.lastLogIndexAndTerm()
+			rs.mutex.Unlock()
 			args := RequestVoteArgs{
-				Term:        currentTerm,
-				CandidateId: rs.id,
+				Term:         currentTerm,
+				CandidateId:  rs.id,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
 			}
 
 			rs.dlog("sending RequestVote to %d: %+v", peerId, args)
@@ -194,6 +227,15 @@ func (rs *RaftService) startElection() {
 	go rs.runElectionTimer()
 }
 
+func (rs *RaftService) lastLogIndexAndTerm() (int, int) {
+	if len(rs.log) > 0 {
+		lastIndex := len(rs.log) - 1
+		return lastIndex, rs.log[lastIndex].Term
+	} else {
+		return -1, -1
+	}
+}
+
 type RequestVoteArgs struct {
 	Term         int
 	CandidateId  int
@@ -213,14 +255,18 @@ func (rs *RaftService) RequestVote(args RequestVoteArgs, reply *RequestVoteReply
 	if rs.state == Dead {
 		return nil
 	}
-	rs.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, rs.currentTerm, rs.voteFor)
+	lastLogIndex, lastLogTerm := rs.lastLogIndexAndTerm()
+	rs.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, rs.currentTerm, rs.voteFor, lastLogIndex, lastLogTerm)
 
 	if args.Term > rs.currentTerm {
 		rs.dlog("... term out of date in RequestVote")
 		rs.becomeFollower(args.Term)
 	}
 
-	if args.Term == rs.currentTerm && (rs.voteFor == -1 || rs.voteFor == args.CandidateId) {
+	if args.Term == rs.currentTerm &&
+		(rs.voteFor == -1 || rs.voteFor == args.CandidateId) &&
+		(args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 		reply.VoteGranted = true
 		rs.voteFor = args.CandidateId
 		rs.electionResetEvent = time.Now()
@@ -256,12 +302,12 @@ func (rs *RaftService) AppendEntries(args AppendEntriesArgs, reply *AppendEntrie
 	}
 	rs.dlog("AppendEntries: %+v", args)
 
-	if args.Term > rs.currentTerm { // リーダーの方が term が進んでいる場合
+	// 1. term < currentTerm の場合は false と応答
+	if rs.currentTerm < args.Term { // リーダーの方が term が進んでいる場合
 		rs.dlog("... term out of date in AppendEntries")
 		rs.becomeFollower(args.Term)
 	}
 
-	// term < currentTerm の場合は false
 	reply.Success = false
 	if args.Term == rs.currentTerm {
 		// Candidate が存在する場合は Follower にする
@@ -270,7 +316,39 @@ func (rs *RaftService) AppendEntries(args AppendEntriesArgs, reply *AppendEntrie
 			rs.becomeFollower(args.Term)
 		}
 		rs.electionResetEvent = time.Now()
-		reply.Success = true
+
+		if args.PrevLogIndex == -1 ||
+			(args.PrevLogIndex < len(rs.log) && args.PrevLogTerm == rs.log[args.PrevLogIndex].Term) {
+			reply.Success = true
+
+			// 挿入する場所を検索する
+			logInsertIndex := args.PrevLogIndex + 1
+			newEntriesIndex := 0
+			for {
+				if logInsertIndex >= len(rs.log) || newEntriesIndex >= len(args.Entries) {
+					break
+				}
+				// 3. 既存のエントリが新しいエントリと競合する場合 (同じインデックスだが異なるターム)、既存のエントリとそれに続くものをすべて削除
+				if rs.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+					break
+				}
+				logInsertIndex++
+				newEntriesIndex++
+			}
+
+			if newEntriesIndex < len(args.Entries) {
+				rs.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				// 4. まだログにないエントリの場合は追加
+				rs.log = append(rs.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				rs.dlog("... log is now: %v", rs.log)
+			}
+			if rs.commitIndex < args.LeaderCommit {
+				// 5. leaderCommit > commitIndex の場合は commitIndex = min(leaderCommit, 最後の新しいエントリのインデックス) を設定
+				rs.commitIndex = min(args.LeaderCommit, len(rs.log)-1)
+				rs.dlog("... setting commitIndex := %d", rs.commitIndex)
+				rs.newCommitReadyChan <- struct{}{}
+			}
+		}
 	}
 
 	reply.Term = rs.currentTerm
@@ -312,11 +390,26 @@ func (rs *RaftService) sendHeartbeats() {
 	rs.mutex.Unlock()
 
 	for _, peerId := range rs.peerIds {
-		args := AppendEntriesArgs{
-			Term:     currentTerm,
-			LeaderId: rs.id,
-		}
 		go func(peerId int) {
+			rs.mutex.Lock()
+			ni := rs.nextIndex[peerId]
+			prevLogIndex := ni - 1
+			prevLogTerm := -1
+			if prevLogIndex >= 0 {
+				prevLogTerm = rs.log[prevLogIndex].Term
+			}
+			entries := rs.log[ni:]
+
+			args := AppendEntriesArgs{
+				Term:         currentTerm,
+				LeaderId:     rs.id,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: rs.commitIndex,
+			}
+			rs.mutex.Unlock()
+
 			rs.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
 			var reply AppendEntriesReply
 			if err := rs.server.Call(peerId, "RaftService.AppendEntries", args, &reply); err == nil {
@@ -326,6 +419,36 @@ func (rs *RaftService) sendHeartbeats() {
 					rs.dlog("term out of date in heartbeat reply")
 					rs.becomeFollower(reply.Term)
 					return
+				}
+
+				if rs.state == Leader && currentTerm == reply.Term {
+					if reply.Success {
+						rs.nextIndex[peerId] = ni + len(entries)
+						rs.matchIndex[peerId] = rs.nextIndex[peerId] - 1
+						rs.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerId, rs.nextIndex, rs.matchIndex)
+
+						commitIndex := rs.commitIndex
+						for i := rs.commitIndex + 1; i < len(rs.log); i++ {
+							if rs.log[i].Term == rs.currentTerm {
+								matchCount := 1
+								for _, peerId := range rs.peerIds {
+									if rs.matchIndex[peerId] >= i {
+										matchCount++
+									}
+								}
+								if matchCount*2 > len(rs.peerIds)+1 {
+									rs.commitIndex = i
+								}
+							}
+						}
+						if rs.commitIndex != commitIndex {
+							rs.dlog("leader sets commitIndex := %d", rs.commitIndex)
+							rs.newCommitReadyChan <- struct{}{}
+						}
+					} else {
+						rs.nextIndex[peerId] = ni - 1
+						rs.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
+					}
 				}
 			}
 		}(peerId)
@@ -347,4 +470,43 @@ func (rs *RaftService) dlog(format string, args ...interface{}) {
 		format = fmt.Sprintf("[%d] ", rs.id) + format
 		log.Printf(format, args...)
 	}
+}
+
+// if the command was send to the leader, it returns true otherwise false
+func (rs *RaftService) Submit(command any) bool {
+	rs.mutex.Lock()
+	defer rs.mutex.Unlock()
+
+	rs.dlog("submit received by %v: %v", rs.state, command)
+	if rs.state == Leader {
+		rs.log = append(rs.log, LogEntry{command, rs.currentTerm})
+		rs.dlog("... log=%v", rs.log)
+		return true
+	}
+	return false
+}
+
+func (rs *RaftService) commitChanSender() {
+	for range rs.newCommitReadyChan {
+		// Find which entries we have to apply.
+		rs.mutex.Lock()
+		savedTerm := rs.currentTerm
+		savedLastApplied := rs.lastApplied
+		var entries []LogEntry
+		if rs.commitIndex > rs.lastApplied {
+			entries = rs.log[rs.lastApplied+1 : rs.commitIndex+1]
+			rs.lastApplied = rs.commitIndex
+		}
+		rs.mutex.Unlock()
+		rs.dlog("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
+
+		for i, entry := range entries {
+			rs.commitChan <- CommitEntry{
+				Command: entry.Command,
+				Index:   savedLastApplied + i + 1,
+				Term:    savedTerm,
+			}
+		}
+	}
+	rs.dlog("commitChanSender done")
 }
