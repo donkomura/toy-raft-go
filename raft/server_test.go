@@ -6,6 +6,7 @@ func TestPingPong(t *testing.T) {
 	n := 3
 	readly := make(chan interface{})
 	servers := make([]*Server, n)
+	commitChans := make([]chan CommitEntry, n)
 	for i := 0; i < n; i++ {
 		pids := make([]int, 0)
 		for j := 0; j < n; j++ {
@@ -14,7 +15,8 @@ func TestPingPong(t *testing.T) {
 			}
 			pids = append(pids, j)
 		}
-		servers[i] = NewServer(i, pids, readly)
+		commitChans[i] = make(chan CommitEntry)
+		servers[i] = NewServer(i, pids, readly, commitChans[i])
 		servers[i].Serve()
 	}
 	for i := 0; i < n; i++ {
@@ -25,6 +27,9 @@ func TestPingPong(t *testing.T) {
 		}
 	}
 	close(readly)
+	for i := 0; i < n; i++ {
+		close(commitChans[i])
+	}
 
 	for i := 0; i < n; i++ {
 		for j := 0; j < n; j++ {
